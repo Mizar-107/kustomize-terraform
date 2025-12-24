@@ -375,6 +375,8 @@ kustomize-tf/
 3. **Lists**: Overlay replaces entirely
 4. **Nested blocks**: Overlay replaces all blocks of same type (matches Terraform override behavior)
 
+> **Exception: `lifecycle` blocks** are merged at the attribute level, not replaced entirely. See [Section 3.3.3](#333-lifecycle-blocks) for details. This matches Terraform's override file behavior where lifecycle arguments are merged individually.
+
 ```hcl
 # BASE
 resource "aws_instance" "web" {
@@ -436,9 +438,11 @@ resource "aws_instance" "web" {
 1. `type`: Overlay replaces (if specified)
 2. `default`: Overlay replaces
 3. `description`: Overlay replaces
-4. `validation`: Overlay replaces ALL validation blocks
+4. `validation`: **Additive** - overlay validation blocks are appended to base validation blocks
 5. `sensitive`: Overlay replaces
 6. `nullable`: Overlay replaces
+
+> **Note on validation blocks:** Unlike other nested blocks that follow a replacement strategy, validation blocks are merged additively. This matches Terraform's behavior and allows overlays to add environment-specific validations without having to redeclare all base validations. This is particularly useful when a base defines general constraints and overlays need to add stricter environment-specific rules.
 
 ```hcl
 # BASE
@@ -446,12 +450,21 @@ variable "instance_type" {
   type        = string
   default     = "t3.micro"
   description = "EC2 instance type"
+
+  validation {
+    condition     = can(regex("^t[23]\\.", var.instance_type))
+    error_message = "Must be a t2 or t3 instance type."
+  }
 }
 
 # OVERLAY
 variable "instance_type" {
   default = "t3.large"   # REPLACES default only
-  # type and description preserved from base
+
+  validation {
+    condition     = !can(regex("^t[23]\\.nano", var.instance_type))
+    error_message = "Nano instances not allowed in production."
+  }
 }
 
 # RESULT
@@ -459,6 +472,17 @@ variable "instance_type" {
   type        = string           # FROM BASE
   default     = "t3.large"       # FROM OVERLAY
   description = "EC2 instance type"  # FROM BASE
+
+  # Both validations are preserved (additive merge)
+  validation {
+    condition     = can(regex("^t[23]\\.", var.instance_type))
+    error_message = "Must be a t2 or t3 instance type."
+  }
+
+  validation {
+    condition     = !can(regex("^t[23]\\.nano", var.instance_type))
+    error_message = "Nano instances not allowed in production."
+  }
 }
 ```
 
@@ -529,7 +553,28 @@ locals {
 }
 ```
 
-> **Note:** Local values are replaced entirely, not deep merged. This is because the value could be any type (string, list, map, expression) and deep merging expressions is not well-defined.
+> **Design Rationale: Why Locals Use Replacement Instead of Deep Merge**
+>
+> Unlike resource attributes (e.g., `tags`) which are known to be maps and can be safely deep-merged, local values have several characteristics that make deep merging problematic:
+>
+> 1. **Type ambiguity:** A local value can be any type (string, number, bool, list, map, object, or complex expression). The tool cannot reliably determine the type without evaluating expressions.
+>
+> 2. **Expression semantics:** Local values often contain expressions like `merge(var.a, var.b)` or complex transformations. Deep merging into such expressions would require expression analysis and rewriting, which is error-prone.
+>
+> 3. **Intentional overrides:** When an overlay specifies a local value, it typically intends to completely replace the base value to customize behavior for that environment.
+>
+> 4. **Consistency with Terraform:** Terraform's override files also replace local values entirely.
+>
+> **If you need to extend a base map in locals**, use Terraform's `merge()` function in the overlay:
+> ```hcl
+> # overlay/locals.tf - explicitly merge with base
+> locals {
+>   common_tags = merge(
+>     { Project = "myapp", Team = "platform" },  # base values
+>     { Environment = "prod" }                    # overlay additions
+>   )
+> }
+> ```
 
 #### 3.2.5 Module Blocks
 
@@ -619,6 +664,23 @@ provider "aws" {
 
 provider "aws" {
   alias  = "west"             # NEW provider config
+  region = "us-west-2"
+}
+
+# RESULT
+provider "aws" {
+  region = "us-west-2"        # FROM OVERLAY (replaced)
+
+  default_tags {
+    tags = {
+      ManagedBy   = "terraform"  # FROM BASE (preserved)
+      Environment = "prod"       # FROM OVERLAY (added)
+    }
+  }
+}
+
+provider "aws" {
+  alias  = "west"             # NEW provider from overlay
   region = "us-west-2"
 }
 ```
@@ -883,6 +945,90 @@ Warning: Merge conflict detected in resource.aws_instance.web
     tags = merge(var.common_tags, { Environment = "prod" })
 ```
 
+### 3.6 Lock File and State Management
+
+#### 3.6.1 `.terraform.lock.hcl` Handling
+
+The dependency lock file (`.terraform.lock.hcl`) requires special consideration since base and overlay may specify different provider versions.
+
+**Strategy:**
+
+1. **Overlay takes precedence:** If an overlay directory contains a `.terraform.lock.hcl` file, it is used exclusively
+2. **Fall back to base:** If no overlay lock file exists, use the base lock file
+3. **Validation:** When both exist, emit a warning if they specify conflicting provider versions
+
+```
+Warning: Lock file conflict detected
+  Base specifies: hashicorp/aws = 4.67.0
+  Overlay specifies: hashicorp/aws = 5.31.0
+
+  Using overlay's .terraform.lock.hcl.
+  Run 'kustomize-tf init -k overlays/prod -- -upgrade' to update dependencies.
+```
+
+**Recommendation:** Users should maintain lock files per overlay to ensure reproducible builds. The overlay's lock file represents the actual deployed state for that environment.
+
+#### 3.6.2 Terraform State Management
+
+**Critical Requirement:** Since kustomize-tf executes terraform in temporary directories that are deleted after each invocation, **all state must be managed via remote backends**.
+
+**Supported Patterns:**
+
+1. **Backend in overlay:** Define a unique backend per overlay
+   ```hcl
+   # overlays/prod/backend.tf
+   terraform {
+     backend "s3" {
+       bucket = "mycompany-terraform-state"
+       key    = "prod/myapp/terraform.tfstate"
+       region = "us-east-1"
+     }
+   }
+   ```
+
+2. **Backend in base with overlay override:** Base defines backend structure, overlay customizes
+   ```hcl
+   # base/backend.tf
+   terraform {
+     backend "s3" {
+       bucket = "mycompany-terraform-state"
+       region = "us-east-1"
+     }
+   }
+
+   # overlays/prod/backend.tf
+   terraform {
+     backend "s3" {
+       key = "prod/myapp/terraform.tfstate"  # REPLACES entire backend
+     }
+   }
+   ```
+
+**Local State Warning:**
+
+If no remote backend is configured, kustomize-tf should emit a warning:
+
+```
+Warning: No remote backend configured
+  Local state files will not persist between kustomize-tf invocations.
+  Configure a remote backend (S3, GCS, Azure, etc.) for production use.
+
+  Alternatively, use --keep-temp to preserve the working directory.
+```
+
+#### 3.6.3 `.terraform` Directory Handling
+
+The `.terraform` directory contains:
+- Downloaded providers
+- Downloaded modules
+- Backend configuration cache
+
+**Strategy:**
+
+1. **Fresh init by default:** Each `kustomize-tf` invocation runs in a fresh temp directory
+2. **Cache optimization (future):** Consider a shared provider cache via `TF_PLUGIN_CACHE_DIR`
+3. **Module caching:** Leverage Terraform's native module caching
+
 ---
 
 ## 4. CLI Interface Design
@@ -907,6 +1053,8 @@ Global Options:
   -q, --quiet                  Suppress non-error output
   --no-color                   Disable colored output
   --debug                      Enable debug logging
+  --keep-temp                  Preserve temp directory after execution (useful for debugging)
+  --temp-dir <path>            Use specified directory instead of creating temp (implies --keep-temp)
 
 Terraform Passthrough:
   Arguments after -- are passed directly to terraform
@@ -956,6 +1104,15 @@ kustomize-tf plan -k overlays/prod
 
 # With terraform options
 kustomize-tf plan -k overlays/prod -- -out=plan.tfplan -var="env=prod"
+
+# Keep temp directory for inspection or to reuse plan file
+kustomize-tf plan -k overlays/prod --keep-temp -- -out=plan.tfplan
+# Output: Temp directory preserved: /tmp/kustomize-tf-abc123
+# The plan file will be at /tmp/kustomize-tf-abc123/plan.tfplan
+
+# Use a specific directory (useful for CI/CD or plan+apply workflows)
+kustomize-tf plan -k overlays/prod --temp-dir ./terraform-work -- -out=plan.tfplan
+kustomize-tf apply -k overlays/prod --temp-dir ./terraform-work -- plan.tfplan
 ```
 
 #### `kustomize-tf apply`
@@ -1468,50 +1625,103 @@ func blockIdentity(block *hclwrite.Block) string {
 ### B.2 Attribute Merge
 
 ```go
-func mergeAttributes(base, overlay *hclwrite.Body, knownMaps map[string]bool) {
-    // Copy all base attributes first
-    for name, attr := range base.Attributes() {
-        if overlay.GetAttribute(name) == nil {
-            // Not in overlay, keep base
-            continue
-        }
+// mergeAttributes merges attributes from overlay into a result body.
+// It handles three cases:
+// 1. Attribute only in base -> copy to result unchanged
+// 2. Attribute only in overlay -> copy to result
+// 3. Attribute in both -> merge (deep merge for maps, replace for scalars)
+func mergeAttributes(base, overlay *hclwrite.Body, knownMaps map[string]bool) *hclwrite.Body {
+    // Create a new result body to avoid modifying inputs
+    result := hclwrite.NewEmptyFile().Body()
 
+    // Track which attributes we've processed
+    processed := make(map[string]bool)
+
+    // First, handle all base attributes
+    for name, baseAttr := range base.Attributes() {
         overlayAttr := overlay.GetAttribute(name)
 
-        if knownMaps[name] && isObjectLiteral(attr) && isObjectLiteral(overlayAttr) {
-            // Deep merge maps
-            merged := deepMergeMaps(attr, overlayAttr)
-            base.SetAttributeRaw(name, merged)
+        if overlayAttr == nil {
+            // Case 1: Only in base - copy unchanged
+            result.SetAttributeRaw(name, baseAttr.Expr().BuildTokens(nil))
         } else {
-            // Replace with overlay
-            base.SetAttributeRaw(name, overlayAttr.Expr().BuildTokens(nil))
+            // Case 3: In both - merge or replace
+            if knownMaps[name] && isObjectLiteral(baseAttr) && isObjectLiteral(overlayAttr) {
+                // Deep merge maps
+                merged := deepMergeMaps(baseAttr, overlayAttr)
+                result.SetAttributeRaw(name, merged)
+            } else {
+                // Replace with overlay value
+                result.SetAttributeRaw(name, overlayAttr.Expr().BuildTokens(nil))
+            }
+        }
+        processed[name] = true
+    }
+
+    // Then, add any overlay-only attributes
+    for name, overlayAttr := range overlay.Attributes() {
+        if !processed[name] {
+            // Case 2: Only in overlay - copy to result
+            result.SetAttributeRaw(name, overlayAttr.Expr().BuildTokens(nil))
         }
     }
 
-    // Add new attributes from overlay
-    for name, attr := range overlay.Attributes() {
-        if base.GetAttribute(name) == nil {
-            base.SetAttributeRaw(name, attr.Expr().BuildTokens(nil))
-        }
-    }
+    return result
 }
 ```
 
 ### B.3 Temp Directory Execution
 
 ```go
-func (e *Executor) Run(cmd string, args []string) error {
-    // Create temp directory
-    tmpDir, err := os.MkdirTemp("", "kustomize-tf-*")
-    if err != nil {
-        return err
-    }
-    defer os.RemoveAll(tmpDir)
+// ExecutorOptions configures the terraform executor behavior
+type ExecutorOptions struct {
+    KeepTemp bool   // If true, don't delete temp directory after execution
+    TempDir  string // If set, use this directory instead of creating a new one
+}
 
-    // Write merged config
+func (e *Executor) Run(cmd string, args []string, opts ExecutorOptions) error {
+    var tmpDir string
+    var err error
+
+    // Create or use existing temp directory
+    if opts.TempDir != "" {
+        tmpDir = opts.TempDir
+        // Ensure directory exists
+        if err := os.MkdirAll(tmpDir, 0700); err != nil {
+            return fmt.Errorf("failed to create temp directory %s: %w", tmpDir, err)
+        }
+    } else {
+        tmpDir, err = os.MkdirTemp("", "kustomize-tf-*")
+        if err != nil {
+            return fmt.Errorf("failed to create temp directory: %w", err)
+        }
+    }
+
+    // Schedule cleanup unless --keep-temp is set
+    if !opts.KeepTemp {
+        defer func() {
+            if removeErr := os.RemoveAll(tmpDir); removeErr != nil {
+                fmt.Fprintf(os.Stderr, "Warning: failed to cleanup temp directory %s: %v\n", tmpDir, removeErr)
+            }
+        }()
+    } else {
+        fmt.Fprintf(os.Stderr, "Temp directory preserved: %s\n", tmpDir)
+    }
+
+    // Write merged config files with restrictive permissions
     for filename, file := range e.merged {
         path := filepath.Join(tmpDir, filename)
-        os.WriteFile(path, file.Bytes(), 0644)
+
+        // Create parent directories if needed (for nested file structures)
+        dir := filepath.Dir(path)
+        if err := os.MkdirAll(dir, 0700); err != nil {
+            return fmt.Errorf("failed to create directory %s: %w", dir, err)
+        }
+
+        // Write with restrictive permissions (0600) since configs may contain sensitive data
+        if err := os.WriteFile(path, file.Bytes(), 0600); err != nil {
+            return fmt.Errorf("failed to write %s: %w", path, err)
+        }
     }
 
     // Execute terraform
@@ -1521,7 +1731,11 @@ func (e *Executor) Run(cmd string, args []string) error {
     tfCmd.Stderr = os.Stderr
     tfCmd.Stdin = os.Stdin
 
-    return tfCmd.Run()
+    if err := tfCmd.Run(); err != nil {
+        return fmt.Errorf("terraform %s failed: %w", cmd, err)
+    }
+
+    return nil
 }
 ```
 
