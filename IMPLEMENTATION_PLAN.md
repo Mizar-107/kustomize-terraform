@@ -438,11 +438,13 @@ resource "aws_instance" "web" {
 1. `type`: Overlay replaces (if specified)
 2. `default`: Overlay replaces
 3. `description`: Overlay replaces
-4. `validation`: **Additive** - overlay validation blocks are appended to base validation blocks
+4. `validation`: Overlay **replaces** all validation blocks (matches Terraform override behavior)
 5. `sensitive`: Overlay replaces
 6. `nullable`: Overlay replaces
 
-> **Note on validation blocks:** Unlike other nested blocks that follow a replacement strategy, validation blocks are merged additively. This matches Terraform's behavior and allows overlays to add environment-specific validations without having to redeclare all base validations. This is particularly useful when a base defines general constraints and overlays need to add stricter environment-specific rules.
+> **Note on validation blocks:** Following Terraform's override file semantics, if an overlay defines any validation blocks, they replace ALL base validation blocks. This ensures predictable behavior consistent with Terraform. If you need to preserve base validations while adding new ones, you must redeclare them in the overlay.
+>
+> **Future Enhancement (Phase 2):** Strategic merge with `$delete` directive will allow more granular control - adding validations without redeclaring, or selectively removing base validations. See [Phase 4 backlog](#phase-4-future-enhancements-backlog).
 
 ```hcl
 # BASE
@@ -467,18 +469,28 @@ variable "instance_type" {
   }
 }
 
-# RESULT
+# RESULT - overlay validation REPLACES base validation
 variable "instance_type" {
   type        = string           # FROM BASE
   default     = "t3.large"       # FROM OVERLAY
   description = "EC2 instance type"  # FROM BASE
 
-  # Both validations are preserved (additive merge)
+  # Only overlay validation remains (base validation replaced)
+  validation {
+    condition     = !can(regex("^t[23]\\.nano", var.instance_type))
+    error_message = "Nano instances not allowed in production."
+  }
+}
+
+# To keep both validations, redeclare in overlay:
+# OVERLAY (preserving base validation)
+variable "instance_type" {
+  default = "t3.large"
+
   validation {
     condition     = can(regex("^t[23]\\.", var.instance_type))
     error_message = "Must be a t2 or t3 instance type."
   }
-
   validation {
     condition     = !can(regex("^t[23]\\.nano", var.instance_type))
     error_message = "Nano instances not allowed in production."
@@ -849,22 +861,35 @@ resource "aws_instance" "web" {
 #### 3.3.4 Provisioners and Connections
 
 **Approach:** Follow Terraform's override behavior:
-- If overlay has provisioners, ALL base provisioners are ignored
+- If overlay has **any** provisioner block, ALL base provisioners are ignored (global replacement, not type-specific)
 - Connection block in overlay completely overrides base
+
+> **Clarification:** Provisioner replacement is global, not type-specific. If the overlay defines a `local-exec` provisioner, it replaces ALL base provisioners including `remote-exec`, `file`, etc. This matches Terraform's override file behavior.
 
 ```hcl
 # BASE
 resource "aws_instance" "web" {
   provisioner "remote-exec" {
-    inline = ["echo base"]
+    inline = ["echo base-remote"]
+  }
+  provisioner "local-exec" {
+    command = "echo base-local"
   }
 }
 
-# OVERLAY
+# OVERLAY - has ONE provisioner
 resource "aws_instance" "web" {
   provisioner "remote-exec" {
-    inline = ["echo overlay"]    # REPLACES ALL provisioners
+    inline = ["echo overlay"]
   }
+}
+
+# RESULT - ALL base provisioners replaced, only overlay provisioner remains
+resource "aws_instance" "web" {
+  provisioner "remote-exec" {
+    inline = ["echo overlay"]
+  }
+  # local-exec from base is GONE
 }
 ```
 
@@ -913,19 +938,29 @@ func isDeepMergeableMap(attrName string, value *hclwrite.Attribute) bool {
 
 func isObjectLiteral(attr *hclwrite.Attribute) bool {
     tokens := attr.Expr().BuildTokens(nil)
-    // Check if first meaningful token is '{'
+    // Check if first meaningful (non-whitespace) token is '{'
     // This indicates an object literal vs. a reference or function call
     for _, tok := range tokens {
         switch tok.Type {
+        // Skip whitespace and newlines
+        case hclsyntax.TokenNewline, hclsyntax.TokenComment:
+            continue
+        // Object literal starts with '{'
         case hclsyntax.TokenOBrace:
             return true
+        // Reference (var.x, local.x) or function call starts with identifier
         case hclsyntax.TokenIdent, hclsyntax.TokenDot:
-            return false // It's a reference like var.tags
+            return false
+        // Any other token means it's not a simple object literal
+        default:
+            return false
         }
     }
     return false
 }
 ```
+
+> **Note:** The hclwrite package's token types may vary. During implementation, verify the exact token type constants available in `hclsyntax`. The key insight is to skip non-semantic tokens (whitespace, comments) before checking the first meaningful token.
 
 ### 3.5 Merge Conflict Detection
 
@@ -1160,7 +1195,7 @@ kustomize {
   # Can be relative path from overlay directory
   base = "../../../base"
 
-  # Alternative: multiple bases (merged in order)
+  # Alternative: multiple bases (merged in order, first = lowest priority)
   # bases = ["../../base", "../../common"]
 
   # Additional resources to include (optional)
@@ -1172,6 +1207,25 @@ kustomize {
   name = "production"
 }
 ```
+
+**Configuration Rules:**
+
+1. **`base` vs `bases`:** These are mutually exclusive. If both are specified, emit an error:
+   ```
+   Error: Invalid kustomize.tf configuration
+     on overlays/prod/kustomize.tf
+
+     Cannot specify both 'base' and 'bases'. Use 'base' for a single base
+     directory, or 'bases' for multiple bases merged in order.
+   ```
+
+2. **Multiple bases merge order:** When using `bases`, directories are merged left-to-right. The first base is lowest priority, subsequent bases override earlier ones, and the overlay has highest priority:
+   ```hcl
+   bases = ["../../base", "../../common", "../../security"]
+   # Merge order: base → common → security → overlay (current dir)
+   ```
+
+3. **Required field:** Either `base` or `bases` must be specified (exactly one).
 
 ### 4.4 Error Handling and User Feedback
 
@@ -1362,8 +1416,20 @@ kustomize {
 
 ### Phase 4: Future Enhancements (Backlog)
 
-- Strategic merge patches (explicit patch files)
-- Resource deletion from overlays (`$delete` directive)
+- **Strategic merge patches** (Kustomize-style granular control)
+  - `$patch: delete` - Remove specific blocks/attributes from base
+  - `$patch: replace` - Explicit full replacement
+  - `$patch: merge` - Force additive merge for nested blocks (e.g., validations)
+  - Example:
+    ```hcl
+    # Remove a specific validation from base
+    variable "instance_type" {
+      validation {
+        $patch = "delete"
+        condition = can(regex("^t[23]\\.", var.instance_type))  # identifies which to delete
+      }
+    }
+    ```
 - Transformers (auto-add tags to all resources)
 - Generators (generate config from external sources)
 - Components (reusable overlay fragments)
@@ -1590,6 +1656,13 @@ Should the tool be workspace-aware?
 ---
 
 ## Appendix B: Example Implementation Snippets
+
+> **API Note:** The code examples below use hclwrite package methods. During implementation, verify the exact API signatures as they may differ slightly from these examples. Key methods to verify:
+> - `Body.SetAttributeRaw(name string, tokens hclwrite.Tokens)` - may need `SetAttributeRaw(name, tokens)` or similar
+> - `Body.GetAttribute(name string)` returns `*Attribute` or `nil`
+> - `Attribute.Expr().BuildTokens(nil)` returns token sequence
+>
+> Refer to [hclwrite package documentation](https://pkg.go.dev/github.com/hashicorp/hcl/v2/hclwrite) for authoritative API details.
 
 ### B.1 Block Matching
 
