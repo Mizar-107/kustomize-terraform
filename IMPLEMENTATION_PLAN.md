@@ -595,10 +595,18 @@ locals {
 **Rules:**
 1. `source`: Overlay replaces (allows pointing to different module)
 2. `version`: Overlay replaces
-3. All input variables: Deep merge (maps deep merge, scalars replace)
+3. All input variables: Scalars replace; known map attributes (e.g., `tags`) deep merge if both are object literals
 4. `providers`: Overlay replaces
 5. `depends_on`: Overlay replaces
 6. `for_each`/`count`: Overlay replaces
+
+> **Schema Limitation:** Unlike resources where we can maintain a list of known map attributes (`tags`, `labels`), module inputs are defined by the module itself. Without evaluating the module schema, kustomize-tf cannot determine which inputs are maps.
+>
+> **Workaround:** For module inputs, deep merge is only applied to:
+> 1. Attributes named `tags`, `labels`, or other known map attribute names
+> 2. Where both base and overlay values are object literals (not expressions)
+>
+> For other map-type inputs, users should use Terraform's `merge()` function in the overlay to combine values explicitly.
 
 ```hcl
 # BASE
@@ -775,11 +783,26 @@ terraform {
 
 **Approach:** Dynamic blocks are treated as nested blocks and follow the nested block replacement rule.
 
+**Matching Behavior:** Nested block replacement matches by **block type name only**, not by whether the block is static or dynamic. This means:
+- A `dynamic "ingress"` block and a static `ingress` block are both "ingress" blocks
+- If overlay has any `ingress` blocks (static or dynamic), ALL base `ingress` blocks are replaced
+- The structure (static vs. dynamic) is determined solely by the overlay
+
 ```hcl
-# BASE
+# BASE - static ingress blocks
 resource "aws_security_group" "web" {
-  dynamic "ingress" {
-    for_each = var.ingress_rules
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# OVERLAY - dynamic block replaces ALL ingress (both static and dynamic)
+resource "aws_security_group" "web" {
+  dynamic "ingress" {           # REPLACES all ingress from base
+    for_each = var.prod_ingress_rules
     content {
       from_port   = ingress.value.from_port
       to_port     = ingress.value.to_port
@@ -789,9 +812,9 @@ resource "aws_security_group" "web" {
   }
 }
 
-# OVERLAY with dynamic block
+# RESULT - only overlay's dynamic block remains
 resource "aws_security_group" "web" {
-  dynamic "ingress" {           # REPLACES all ingress (including dynamic)
+  dynamic "ingress" {
     for_each = var.prod_ingress_rules
     content {
       from_port   = ingress.value.from_port
@@ -940,27 +963,36 @@ func isObjectLiteral(attr *hclwrite.Attribute) bool {
     tokens := attr.Expr().BuildTokens(nil)
     // Check if first meaningful (non-whitespace) token is '{'
     // This indicates an object literal vs. a reference or function call
+    //
+    // NOTE: hclwrite.Token uses its own Type field (hclwrite.TokenType),
+    // not hclsyntax.TokenType. Check the token's Bytes content instead
+    // for more reliable detection.
     for _, tok := range tokens {
-        switch tok.Type {
-        // Skip whitespace and newlines
-        case hclsyntax.TokenNewline, hclsyntax.TokenComment:
+        // Skip whitespace tokens (check bytes for spaces/newlines)
+        if len(tok.Bytes) == 0 || isWhitespace(tok.Bytes) {
             continue
-        // Object literal starts with '{'
-        case hclsyntax.TokenOBrace:
-            return true
-        // Reference (var.x, local.x) or function call starts with identifier
-        case hclsyntax.TokenIdent, hclsyntax.TokenDot:
-            return false
-        // Any other token means it's not a simple object literal
-        default:
-            return false
         }
+        // Object literal starts with '{'
+        if tok.Bytes[0] == '{' {
+            return true
+        }
+        // Any other first meaningful token means it's not a simple object literal
+        return false
     }
     return false
 }
+
+func isWhitespace(b []byte) bool {
+    for _, c := range b {
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+            return false
+        }
+    }
+    return true
+}
 ```
 
-> **Note:** The hclwrite package's token types may vary. During implementation, verify the exact token type constants available in `hclsyntax`. The key insight is to skip non-semantic tokens (whitespace, comments) before checking the first meaningful token.
+> **Implementation Note:** The hclwrite package uses `hclwrite.Token` with a `Bytes` field containing the raw token content. This is distinct from `hclsyntax.Token` used for parsing. When implementing, inspect the actual token bytes rather than relying on token type constants. Verify the exact API by examining the [hclwrite source code](https://github.com/hashicorp/hcl/tree/main/hclwrite).
 
 ### 3.5 Merge Conflict Detection
 
@@ -1021,7 +1053,7 @@ Warning: Lock file conflict detected
    }
    ```
 
-2. **Backend in base with overlay override:** Base defines backend structure, overlay customizes
+2. **Backend in base with overlay override:** Overlay must specify complete backend (replacement, not merge)
    ```hcl
    # base/backend.tf
    terraform {
@@ -1031,13 +1063,17 @@ Warning: Lock file conflict detected
      }
    }
 
-   # overlays/prod/backend.tf
+   # overlays/prod/backend.tf - MUST include ALL required attributes
    terraform {
      backend "s3" {
-       key = "prod/myapp/terraform.tfstate"  # REPLACES entire backend
+       bucket = "mycompany-terraform-state"  # Must redeclare
+       key    = "prod/myapp/terraform.tfstate"
+       region = "us-east-1"                  # Must redeclare
      }
    }
    ```
+
+   > **Important:** Backend blocks are replaced entirely, not merged. The overlay must specify all required backend attributes. A partial backend specification will cause Terraform errors.
 
 **Local State Warning:**
 
@@ -1050,6 +1086,19 @@ Warning: No remote backend configured
 
   Alternatively, use --keep-temp to preserve the working directory.
 ```
+
+**Note on State Files During Initialization:**
+
+Even with remote backends configured, Terraform may create temporary local files during initialization:
+- `.terraform.tfstate` - Backend configuration cache
+- `.terraform.tfstate.backup` - Backup of above
+
+These files are safe to lose when the temp directory is deleted because:
+1. They only cache backend configuration metadata, not actual infrastructure state
+2. The real state is stored in the remote backend
+3. Terraform recreates them on next `init`
+
+However, if using local backend (not recommended), the state file IS the source of truth and will be lost. This is why remote backends are required for production use.
 
 #### 3.6.3 `.terraform` Directory Handling
 
@@ -1811,6 +1860,19 @@ func (e *Executor) Run(cmd string, args []string, opts ExecutorOptions) error {
     return nil
 }
 ```
+
+> **Permissions Note for CI/CD Environments:**
+>
+> The default permissions (0700 for directories, 0600 for files) are designed for single-user security. In multi-user CI/CD environments where:
+> - Multiple processes or users need to read the generated files
+> - Terraform is executed by a different user than kustomize-tf
+>
+> Consider these alternatives:
+> 1. **Use `--temp-dir`** with a shared directory that has appropriate group permissions
+> 2. **Set umask** before running kustomize-tf to control default permissions
+> 3. **Future enhancement:** Add `--file-mode` and `--dir-mode` flags to configure permissions
+>
+> The restrictive defaults are intentional since Terraform configurations may contain sensitive values (API keys in provider blocks, secrets in variables, etc.).
 
 ---
 
