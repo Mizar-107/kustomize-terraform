@@ -528,9 +528,10 @@ output "instance_id" {
 **Identity:** Single `locals` block (all locals blocks are merged first, then overlay applied)
 
 **Rules:**
-1. Each local value is treated independently
-2. Overlay local values replace base local values of the same name
-3. Base local values not in overlay are preserved
+1. The `locals` block itself is **merged** - local values from both base and overlay appear in the result
+2. Individual local values with the same name are **replaced** (overlay wins)
+3. Base local values not in overlay are **preserved**
+4. Local values are NOT deep-merged (even if they contain maps)
 
 ```hcl
 # BASE
@@ -544,24 +545,25 @@ locals {
 
 # OVERLAY
 locals {
-  environment = "prod"          # REPLACES
-  region      = "us-east-1"     # ADDS
-  common_tags = {               # REPLACES ENTIRELY (it's a local value, not a map attribute)
+  environment = "prod"          # REPLACES base value
+  region      = "us-east-1"     # ADDS new local (not in base)
+  common_tags = {               # REPLACES base value (not deep-merged, see note below)
     Project     = "myapp"
     Team        = "platform"
     Environment = "prod"
   }
 }
 
-# RESULT
+# RESULT - locals block is MERGED, but individual values are REPLACED
 locals {
-  environment = "prod"
-  region      = "us-east-1"
-  common_tags = {
+  environment = "prod"          # FROM OVERLAY (replaced "dev")
+  region      = "us-east-1"     # FROM OVERLAY (added)
+  common_tags = {               # FROM OVERLAY (entire value replaced, not deep-merged)
     Project     = "myapp"
     Team        = "platform"
     Environment = "prod"
   }
+  # Note: If base had other locals not in overlay, they would appear here
 }
 ```
 
